@@ -50,15 +50,15 @@ cygwin in no-cygwin mode).
 import os
 import sys
 import copy
-from subprocess import Popen, PIPE, check_output
-import re
+import shlex
+from subprocess import check_output
 
 from distutils.unixccompiler import UnixCCompiler
 from distutils.file_util import write_file
 from distutils.errors import (DistutilsExecError, CCompilerError,
         CompileError, UnknownFileError)
 from distutils.version import LooseVersion
-from distutils.spawn import find_executable
+
 
 def get_msvcr():
     """Include the appropriate MSVC runtime library if Python was built
@@ -93,7 +93,7 @@ def get_msvcr():
            return ['ucrt', 'vcruntime140'] 
         else:
             raise ValueError("Unknown MS Compiler version %s " % msc_ver)
-
+    return [] # rather than returning None, return empty list
 
 class CygwinCCompiler(UnixCCompiler):
     """ Handles the Cygwin port of the GNU C compiler to Windows.
@@ -102,6 +102,7 @@ class CygwinCCompiler(UnixCCompiler):
     obj_extension = ".o"
     static_lib_extension = ".a"
     shared_lib_extension = ".dll"
+    dylib_lib_extension = ".dll.a"
     static_lib_format = "lib%s%s"
     shared_lib_format = "%s%s"
     exe_extension = ".exe"
@@ -123,33 +124,14 @@ class CygwinCCompiler(UnixCCompiler):
         self.cc = os.environ.get('CC', 'gcc')
         self.cxx = os.environ.get('CXX', 'g++')
 
-        if ('gcc' in self.cc): # Start gcc workaround
-            self.gcc_version, self.ld_version, self.dllwrap_version = \
-                get_versions()
-            self.debug_print(self.compiler_type + ": gcc %s, ld %s, dllwrap %s\n" %
-                             (self.gcc_version,
-                              self.ld_version,
-                              self.dllwrap_version) )
+        # Older numpy dependend on this existing to check for ancient
+        # gcc versions. This doesn't make much sense with clang etc so
+        # just hardcode to something recent.
+        # https://github.com/numpy/numpy/pull/20333
+        self.gcc_version = LooseVersion("11.2.0")
 
-            # ld_version >= "2.10.90" and < "2.13" should also be able to use
-            # gcc -mdll instead of dllwrap
-            # Older dllwraps had own version numbers, newer ones use the
-            # same as the rest of binutils ( also ld )
-            # dllwrap 2.10.90 is buggy
-            if self.ld_version >= "2.10.90":
-                self.linker_dll = self.cc
-            else:
-                self.linker_dll = "dllwrap"
-
-            # ld_version >= "2.13" support -shared so use it instead of
-            # -mdll -static
-            if self.ld_version >= "2.13":
-                shared_option = "-shared"
-            else:
-                shared_option = "-mdll -static"
-        else: # Assume linker is up to date
-            self.linker_dll = self.cc
-            shared_option = "-shared"
+        self.linker_dll = self.cc
+        shared_option = "-shared"
 
         self.set_executables(compiler='%s -mcygwin -O -Wall' % self.cc,
                              compiler_so='%s -mcygwin -mdll -O -Wall' % self.cc,
@@ -158,17 +140,9 @@ class CygwinCCompiler(UnixCCompiler):
                              linker_so=('%s -mcygwin %s' %
                                         (self.linker_dll, shared_option)))
 
-        # cygwin and mingw32 need different sets of libraries
-        if ('gcc' in self.cc and self.gcc_version == "2.91.57"):
-            # cygwin shouldn't need msvcrt, but without the dlls will crash
-            # (gcc version 2.91.57) -- perhaps something about initialization
-            self.dll_libraries=["msvcrt"]
-            self.warn(
-                "Consider upgrading to a newer version of gcc")
-        else:
-            # Include the appropriate MSVC runtime library if Python was built
-            # with MSVC 7.0 or later.
-            self.dll_libraries = get_msvcr()
+        # Include the appropriate MSVC runtime library if Python was built
+        # with MSVC 7.0 or later.
+        self.dll_libraries = get_msvcr()
 
     def _compile(self, obj, src, ext, cc_args, extra_postargs, pp_opts):
         """Compiles the source by spawning GCC and windres if needed."""
@@ -176,6 +150,28 @@ class CygwinCCompiler(UnixCCompiler):
             # gcc needs '.res' and '.rc' compiled to object files !!!
             try:
                 self.spawn(["windres", "-i", src, "-o", obj])
+            except DistutilsExecError as msg:
+                raise CompileError(msg)
+        elif ext == '.mc':
+            # Adapted from msvc9compiler:
+            #
+            # Compile .MC to .RC file to .RES file.
+            #   * '-h dir' specifies the directory for the generated include file
+            #   * '-r dir' specifies the target directory of the generated RC file and the binary message resource it includes
+            #
+            # For now (since there are no options to change this),
+            # we use the source-directory for the include file and
+            # the build directory for the RC file and message
+            # resources. This works at least for win32all.
+            h_dir = os.path.dirname(src)
+            rc_dir = os.path.dirname(obj)
+            try:
+                # first compile .MC to .RC and .H file
+                self.spawn(['windmc'] + ['-h', h_dir, '-r', rc_dir] + [src])
+                base, _ = os.path.splitext(os.path.basename(src))
+                rc_file = os.path.join(rc_dir, base + '.rc')
+                # then compile .RC to .RES file
+                self.spawn(['windres', '-i', rc_file, '-o', obj])
             except DistutilsExecError as msg:
                 raise CompileError(msg)
         else: # for other files use the C-compiler
@@ -230,24 +226,17 @@ class CygwinCCompiler(UnixCCompiler):
 
             # next add options for def-file and to creating import libraries
 
-            # dllwrap uses different options than gcc/ld
-            if self.linker_dll == "dllwrap":
-                extra_preargs.extend(["--output-lib", lib_file])
-                # for dllwrap we have to use a special option
-                extra_preargs.extend(["--def", def_file])
-            # we use gcc/ld here and can be sure ld is >= 2.9.10
-            else:
-                # doesn't work: bfd_close build\...\libfoo.a: Invalid operation
-                #extra_preargs.extend(["-Wl,--out-implib,%s" % lib_file])
-                # for gcc/ld the def-file is specified as any object files
-                objects.append(def_file)
+            # doesn't work: bfd_close build\...\libfoo.a: Invalid operation
+            #extra_preargs.extend(["-Wl,--out-implib,%s" % lib_file])
+            # for gcc/ld the def-file is specified as any object files
+            objects.append(def_file)
 
         #end: if ((export_symbols is not None) and
         #        (target_desc != self.EXECUTABLE or self.linker_dll == "gcc")):
 
         # who wants symbols and a many times larger output file
         # should explicitly switch the debug mode on
-        # otherwise we let dllwrap/ld strip the output file
+        # otherwise we let ld strip the output file
         # (On my machine: 10KiB < stripped_file < ??100KiB
         #   unstripped_file = stripped_file + XXX KiB
         #  ( XXX=254 for a typical python extension))
@@ -269,11 +258,16 @@ class CygwinCCompiler(UnixCCompiler):
             output_dir = ''
         obj_names = []
         for src_name in source_filenames:
-            # use normcase to make sure '.rc' is really '.rc' and not '.RC'
-            base, ext = os.path.splitext(os.path.normcase(src_name))
-            if ext not in (self.src_extensions + ['.rc','.res']):
+            base, ext = os.path.splitext(src_name)
+            # use 'normcase' only for resource suffixes
+            _ext_normcase = os.path.normcase(ext)
+            if _ext_normcase in ['.rc', '.res', '.mc']:
+                ext = _ext_normcase
+            if ext not in (self.src_extensions + ['.rc', '.res', '.mc']):
                 raise UnknownFileError("unknown file type '%s' (from '%s')" % \
                       (ext, src_name))
+            base = os.path.splitdrive(base)[1] # Remove the drive
+            base = base[os.path.isabs(base):]  # If abs, remove leading /
             if strip_dir:
                 base = os.path.basename (base)
             if ext in ('.res', '.rc'):
@@ -294,32 +288,18 @@ class Mingw32CCompiler(CygwinCCompiler):
     def __init__(self, verbose=0, dry_run=0, force=0):
 
         CygwinCCompiler.__init__ (self, verbose, dry_run, force)
-
-        # ld_version >= "2.13" support -shared so use it instead of
-        # -mdll -static
-        if ('gcc' in self.cc and self.ld_version < "2.13"):
-            shared_option = "-mdll -static"
-        else:
-            shared_option = "-shared"
-
-        # A real mingw32 doesn't need to specify a different entry point,
-        # but cygwin 2.91.57 in no-cygwin-mode needs it.
-        if ('gcc' in self.cc and self.gcc_version <= "2.91.57"):
-            entry_point = '--entry _DllMain@12'
-        else:
-            entry_point = ''
+        shared_option = "-shared"
 
         if is_cygwincc(self.cc):
             raise CCompilerError(
                 'Cygwin gcc cannot be used with --compiler=mingw32')
 
-        self.set_executables(compiler='%s -O -Wall' % self.cc,
-                             compiler_so='%s -mdll -O -Wall' % self.cc,
-                             compiler_cxx='%s -O -Wall' % self.cxx,
+        self.set_executables(compiler='%s -O2 -Wall' % self.cc,
+                             compiler_so='%s -mdll -O2 -Wall' % self.cc,
+                             compiler_cxx='%s -O2 -Wall' % self.cxx,
                              linker_exe='%s' % self.cc,
-                             linker_so='%s %s %s'
-                                        % (self.linker_dll, shared_option,
-                                           entry_point))
+                             linker_so='%s %s'
+                                        % (self.linker_dll, shared_option))
         # Maybe we should also append -mthreads, but then the finished
         # dlls need another dll (mingwm10.dll see Mingw32 docs)
         # (-mthreads: Support thread-safe exception handling on `Mingw32')
@@ -386,38 +366,7 @@ def check_config_h():
         return (CONFIG_H_UNCERTAIN,
                 "couldn't read '%s': %s" % (fn, exc.strerror))
 
-RE_VERSION = re.compile(br'(\d+\.\d+(\.\d+)*)')
-
-def _find_exe_version(cmd):
-    """Find the version of an executable by running `cmd` in the shell.
-
-    If the command is not found, or the output does not match
-    `RE_VERSION`, returns None.
-    """
-    executable = cmd.split()[0]
-    if find_executable(executable) is None:
-        return None
-    out = Popen(cmd, shell=True, stdout=PIPE).stdout
-    try:
-        out_string = out.read()
-    finally:
-        out.close()
-    result = RE_VERSION.search(out_string)
-    if result is None:
-        return None
-    # LooseVersion works with strings
-    # so we need to decode our bytes
-    return LooseVersion(result.group(1).decode())
-
-def get_versions():
-    """ Try to find out the versions of gcc, ld and dllwrap.
-
-    If not possible it returns None for it.
-    """
-    commands = ['gcc -dumpversion', 'ld -v', 'dllwrap --version']
-    return tuple([_find_exe_version(cmd) for cmd in commands])
-
 def is_cygwincc(cc):
     '''Try to determine if the compiler that would be used is from cygwin.'''
-    out_string = check_output([cc, '-dumpmachine'])
+    out_string = check_output(shlex.split(cc) + ['-dumpmachine'])
     return out_string.strip().endswith(b'cygwin')
