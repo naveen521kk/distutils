@@ -21,6 +21,26 @@ jobs:
       - name: Run tests
         run: tox
 
+  test_msys2_mingw:
+    strategy:
+      matrix:
+        include:
+          - { sys: mingw64, env: x86_64 }
+          - { sys: mingw32, env: i686 }
+          - { sys: ucrt64,  env: ucrt-x86_64 }
+          - { sys: clang64, env: clang-x86_64 }
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{matrix.sys}}
+          install: |
+            mingw-w64-${{matrix.env}}-python
+            mingw-w64-${{matrix.env}}-python-tox
+      - name: Run tests
+        run: tox
+
   ci_setuptools:
     # Integration testing with setuptools
     strategy:
@@ -74,3 +94,4 @@ jobs:
         env:
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
